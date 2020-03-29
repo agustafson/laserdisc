@@ -2,8 +2,9 @@ package laserdisc
 package fs2
 
 import cats.Eq
+import cats.data.NonEmptySet
 import cats.effect.concurrent.{Deferred, Ref}
-import cats.effect.{Blocker, Concurrent, ContextShift, Fiber, Resource, Sync, Timer}
+import cats.effect.{Blocker, Concurrent, ContextShift, Fiber, Resource, Timer}
 import cats.syntax.all._
 import log.effect.LogWriter
 import shapeless._
@@ -13,17 +14,6 @@ import log.effect.fs2.syntax._
 import scala.concurrent.duration._
 
 object RedisClient {
-
-  /**
-    * Creates a redis client that will handle the blocking network
-    * connection's operations on a cached thread pool.
-    */
-  @inline final def apply[F[_]: LogWriter: Concurrent: ContextShift: Timer](
-      addresses: Set[RedisAddress],
-      writeTimeout: Option[FiniteDuration] = Some(10.seconds),
-      readMaxBytes: Int = 256 * 1024
-  ): Resource[F, RedisClient[F]] =
-    Blocker[F] >>= (blockingPool => blockingOn(blockingPool)(addresses, writeTimeout, readMaxBytes))
 
   /**
     * Creates a redis client for a single redis node
@@ -36,7 +26,7 @@ object RedisClient {
       writeTimeout: Option[FiniteDuration] = Some(10.seconds),
       readMaxBytes: Int = 256 * 1024
   ): Resource[F, RedisClient[F]] =
-    Blocker[F] >>= (blockingPool => blockingOn(blockingPool)(Set(RedisAddress(host, port)), writeTimeout, readMaxBytes))
+    Blocker[F] >>= (blockingPool => toNodeBlockingOn(blockingPool)(host, port, writeTimeout, readMaxBytes))
 
   /**
     * Creates a redis client for a single redis node
@@ -51,7 +41,33 @@ object RedisClient {
       writeTimeout: Option[FiniteDuration] = Some(10.seconds),
       readMaxBytes: Int = 256 * 1024
   ): Resource[F, RedisClient[F]] =
-    blockingOn(blockingPool)(Set(RedisAddress(host, port)), writeTimeout, readMaxBytes)
+    blockingOn(blockingPool)(RedisSingleNodeConnection(RedisAddress(host, port)), writeTimeout, readMaxBytes)
+
+  /**
+    * Creates a redis client for a redis cluster
+    * that will handle the blocking network connection's
+    * operations on a cached thread pool.
+    */
+  @inline final def toCluster[F[_]: Concurrent: ContextShift: Timer: LogWriter](
+      addresses: NonEmptySet[RedisAddress],
+      writeTimeout: Option[FiniteDuration] = Some(10.seconds),
+      readMaxBytes: Int = 256 * 1024
+  ): Resource[F, RedisClient[F]] =
+    Blocker[F] >>= (blockingPool => toClusterBlockingOn(blockingPool)(addresses, writeTimeout, readMaxBytes))
+
+  /**
+    * Creates a redis client for a redis cluster
+    * that will handle the blocking network connection's
+    * operations on a cached thread pool.
+    */
+  @inline final def toClusterBlockingOn[F[_]: Concurrent: ContextShift: Timer: LogWriter](
+      blockingPool: Blocker
+  )(
+      addresses: NonEmptySet[RedisAddress],
+      writeTimeout: Option[FiniteDuration] = Some(10.seconds),
+      readMaxBytes: Int = 256 * 1024
+  ): Resource[F, RedisClient[F]] =
+    blockingOn(blockingPool)(RedisClusterConnection(addresses), writeTimeout, readMaxBytes)
 
   /**
     * Creates a redis client allowing to specify what blocking
@@ -61,11 +77,25 @@ object RedisClient {
   @inline final def blockingOn[F[_]: LogWriter: Concurrent: ContextShift: Timer](
       blockingPool: Blocker
   )(
-      addresses: Set[RedisAddress],
+      connection: RedisConnection,
       writeTimeout: Option[FiniteDuration] = Some(10.seconds),
       readMaxBytes: Int = 256 * 1024
   ): Resource[F, RedisClient[F]] = {
-    def redisConnection(address: RedisAddress): Pipe[F, RESP, RESP] =
+    val getAddress: RedisConnection => F[RedisAddress] = {
+      case RedisSingleNodeConnection(redisAddress) =>
+        redisAddress.pure[F]
+      case RedisClusterConnection(redisAddresses) =>
+        // TODO: find cluster addresses
+        redisAddresses.head.pure[F]
+//        redisAddresses.foldMapM { address =>
+//          connectToAddress(address)
+//        }
+//          .collectFirstSomeM {
+//          address => connectToAddress(address)
+//        }
+    }
+
+    def connectToAddress(address: RedisAddress): Pipe[F, RESP, RESP] =
       stream =>
         Stream.eval(address.toInetSocketAddress) >>= { address =>
           stream.through(
@@ -74,7 +104,7 @@ object RedisClient {
         }
 
     val establishedConnection: Resource[F, impl.Connection[F]] =
-      impl.connection(redisConnection, impl.currentServer(addresses.toSeq))
+      impl.connection(getAddress, connectToAddress, connection)
 
     establishedConnection >>= { conn => impl.mkClient(conn) }
   }
@@ -97,7 +127,7 @@ object RedisClient {
     }
 
     def mkClient[F[_]: Concurrent: Timer: LogWriter](establishedConn: Connection[F]): Resource[F, RedisClient[F]] =
-      Resource.make(mkPublisher(establishedConn) >>= { publ => publ.start map (_ => publ) })(_.shutdown) map { publisher =>
+      Resource.make(mkPublisher(establishedConn).flatTap(_.start))(_.shutdown) map { publisher =>
         new RedisClient[F] {
           override final def send[In <: HList, Out <: HList](in: In, timeout: FiniteDuration)(
               implicit handler: RedisHandler.Aux[F, In, Out]
@@ -105,12 +135,10 @@ object RedisClient {
         }
       }
 
-    def currentServer[F[_]: Sync](addresses: Seq[RedisAddress]): F[Option[RedisAddress]] =
-      Stream.emits(addresses).covary[F].compile.last //FIXME yeah, well...
-
     def connection[F[_]: Concurrent: Timer: LogWriter](
-        redisConnection: RedisAddress => Pipe[F, RESP, RESP],
-        leader: F[Option[RedisAddress]]
+        getAddress: RedisConnection => F[RedisAddress],
+        connect: RedisAddress => Pipe[F, RESP, RESP],
+        redisConnection: RedisConnection
     ): Resource[F, Connection[F]] =
       Resource.liftF(Deferred[F, Throwable | Unit]) >>= { termSignal =>
         Resource.liftF(Queue.unbounded[F, Request[F]]) >>= { queue =>
@@ -130,7 +158,7 @@ object RedisClient {
               LogWriter.infoS(s"Server available for publishing: $address") >>
                 queue.dequeue
                   .evalMap(push)
-                  .through(redisConnection(address))
+                  .through(connect(address))
                   .evalMap { resp =>
                     pop >>= {
                       case Some(Request(protocol, cb)) => cb(protocol.decode(resp))
@@ -138,55 +166,57 @@ object RedisClient {
                     }
                   } ++ Stream.raiseError(ServerTerminatedConnection(address))
 
-            val serverStream: Stream[F, Option[RedisAddress]] =
-              Stream.eval(leader)
+//            val serverStream: Stream[F, Option[RedisAddress]] =
+//              Stream.eval(leader)
+//
+//            def serverUnavailable: Stream[F, RedisAddress] =
+//              LogWriter.errorS("Server unavailable for publishing") >>
+//                Stream.eval(Signal[F, Option[RedisAddress]](None)).flatMap { serverSignal =>
+//                  val cancelIncoming = queue.dequeue.evalMap(_.callback(Left(ServerUnavailable))).drain
+//                  val queryLeader = (Stream.awakeEvery[F](3.seconds) >> serverStream) //FIXME magic number
+//                    .evalMap(maybeAddress => serverSignal.update(_ => maybeAddress))
+//                    .drain
+//
+//                  cancelIncoming
+//                    .mergeHaltBoth(queryLeader)
+//                    .covaryOutput[RedisAddress]
+//                    .interruptWhen(serverSignal.map(_.nonEmpty)) ++ serverSignal.discrete.head.flatMap {
+//                    case None          => serverUnavailable // impossible
+//                    case Some(address) => LogWriter.debugS(s"Publisher got address: $address") >> Stream.emit(address)
+//                  }
+//                }
 
-            def serverUnavailable: Stream[F, RedisAddress] =
-              LogWriter.errorS("Server unavailable for publishing") >>
-                Stream.eval(Signal[F, Option[RedisAddress]](None)).flatMap { serverSignal =>
-                  val cancelIncoming = queue.dequeue.evalMap(_.callback(Left(ServerUnavailable))).drain
-                  val queryLeader = (Stream.awakeEvery[F](3.seconds) >> serverStream) //FIXME magic number
-                    .evalMap(maybeAddress => serverSignal.update(_ => maybeAddress))
-                    .drain
-
-                  cancelIncoming
-                    .mergeHaltBoth(queryLeader)
-                    .covaryOutput[RedisAddress]
-                    .interruptWhen(serverSignal.map(_.nonEmpty)) ++ serverSignal.discrete.head.flatMap {
-                    case None          => serverUnavailable // impossible
-                    case Some(address) => LogWriter.debugS(s"Publisher got address: $address") >> Stream.emit(address)
-                  }
-                }
-
-            def runner(knownServer: Stream[F, Option[RedisAddress]], lastFailedServer: Option[RedisAddress] = None): Stream[F, Unit] =
-              knownServer.flatMap {
-                case None =>
-                  serverUnavailable.flatMap(address => runner(Stream.emit(Some(address))))
-
-                case Some(address) =>
-                  lastFailedServer match {
-                    case Some(failedAddress) if address === failedAddress =>
-                      // this indicates that cluster sill thinks the address is same as the one that failed us, for that reason
-                      // we have to suspend execution for while and retry in FiniteDuration
-                      LogWriter.warnS(s"New server is same like the old one ($address): currently unavailable") >>
-                        serverUnavailable.flatMap(address => runner(Stream.emit(Some(address))))
-
-                    case _ =>
-                      // connection with address will always fail with error.
-                      // TODO so when that happens, all open requests are completed
-                      // and runner is rerun to switch likely to serverUnavailable.
-                      // as the last action runner is restarted
-                      serverAvailable(address) handleErrorWith { failure =>
-                        LogWriter.errorS(s"Failure of publishing connection to $address", failure) >>
-                          runner(serverStream, Some(address))
-                      }
-                  }
-              }
+//            def runner(knownServer: Stream[F, Option[RedisAddress]], lastFailedServer: Option[RedisAddress] = None): Stream[F, Unit] =
+//              knownServer.flatMap {
+//                case None =>
+//                  serverUnavailable.flatMap(address => runner(Stream.emit(Some(address))))
+//
+//                case Some(address) =>
+//                  lastFailedServer match {
+//                    case Some(failedAddress) if address === failedAddress =>
+//                      // this indicates that cluster sill thinks the address is same as the one that failed us, for that reason
+//                      // we have to suspend execution for while and retry in FiniteDuration
+//                      LogWriter.warnS(s"New server is same like the old one ($address): currently unavailable") >>
+//                        serverUnavailable.flatMap(address => runner(Stream.emit(Some(address))))
+//
+//                    case _ =>
+//                      // connection with address will always fail with error.
+//                      // TODO so when that happens, all open requests are completed
+//                      // and runner is rerun to switch likely to serverUnavailable.
+//                      // as the last action runner is restarted
+//                      serverAvailable(address) handleErrorWith { failure =>
+//                        LogWriter.errorS(s"Failure of publishing connection to $address", failure) >>
+//                          runner(serverStream, Some(address))
+//                      }
+//                  }
+//              }
 
             val newConnection = new Connection[F] {
               override final def run: F[Fiber[F, Unit]] =
                 LogWriter.info("Starting connection") >>
-                  runner(serverStream)
+                  Stream
+                    .eval(getAddress(redisConnection))
+                    .flatMap(serverAvailable)
                     .interruptWhen(termSignal)
                     .compile
                     .drain
