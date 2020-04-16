@@ -33,7 +33,7 @@ before_install:
 before_script:
 - docker run -p 6379:6379 -d redis:alpine
 - docker run -p 6380:6379 -d eqalpha/keydb
-- docker run -e "IP=0.0.0.0" grokzen/redis-cluster:latest
+- docker run -e "IP=0.0.0.0" -p 7000:7000 -p 7001:7001 -p 7002:7002 -p 7003:7003 -p 7004:7004 -p 7005:7005 grokzen/redis-cluster:latest
 
 script:
 - sbt -Dfile.encoding=UTF8 -Dsbt.color=always -Dsbt.supershell=false ++$TRAVIS_SCALA_VERSION fullBuild
