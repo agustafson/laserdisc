@@ -3,6 +3,7 @@ package fs2
 
 import java.util.concurrent.ForkJoinPool
 
+import cats.data.NonEmptySet
 import cats.effect._
 import cats.syntax.applicativeError._
 import cats.syntax.apply._
@@ -10,6 +11,7 @@ import cats.syntax.flatMap._
 import cats.syntax.functor._
 import cats.syntax.traverse._
 import laserdisc.auto._
+import laserdisc.fs2.RedisAddress.portOrder
 import log.effect.LogWriter
 import log.effect.fs2.SyncLogWriter.noOpLog
 import org.scalatest.matchers.should.Matchers
@@ -19,10 +21,21 @@ import scala.collection.parallel.immutable.ParSeq
 import scala.concurrent.ExecutionContext
 import scala.concurrent.ExecutionContext.fromExecutor
 
-final class RedisClientSpec extends ClientSpec(6379)
-final class KeyDbClientSpec extends ClientSpec(6380)
+final class RedisClientSpec  extends SingleNodeClientSpec(6379)
+final class KeyDbClientSpec  extends SingleNodeClientSpec(6380)
+final class RedisClusterSpec extends ClusteredClientSpec(NonEmptySet.of[Port](7000, 7001, 7002, 7003, 7004, 7005))
 
-private[fs2] abstract class ClientSpec(p: Port) extends ClientBaseSpec[IO](p) {
+private[fs2] abstract class SingleNodeClientSpec(p: Port) extends ClientSpec {
+  def clientUnderTest: Resource[IO, RedisClient[IO]] =
+    RedisClient.toNode("127.0.0.1", p)
+}
+
+private[fs2] abstract class ClusteredClientSpec(ports: NonEmptySet[Port]) extends ClientSpec {
+  def clientUnderTest: Resource[IO, RedisClient[IO]] =
+    RedisClient.toCluster(ports.map(port => RedisAddress("127.0.0.1", port)))
+}
+
+private[fs2] trait ClientSpec extends ClientBaseSpec[IO] {
   private[this] val ec: ExecutionContext = fromExecutor(new ForkJoinPool())
 
   override implicit val contextShift: ContextShift[IO] = IO.contextShift(ec)
@@ -33,15 +46,14 @@ private[fs2] abstract class ClientSpec(p: Port) extends ClientBaseSpec[IO](p) {
   override def run[A]: IO[A] => A = _.unsafeRunSync()
 }
 
-private[fs2] abstract class ClientBaseSpec[F[_]](p: Port) extends AnyWordSpecLike with Matchers {
+private[fs2] trait ClientBaseSpec[F[_]] extends AnyWordSpecLike with Matchers {
   implicit def contextShift: ContextShift[F]
   implicit def timer: Timer[F]
   implicit def concurrent: Concurrent[F]
   implicit def logger: LogWriter[F]
 
   def run[A]: F[A] => A
-  def clientUnderTest: Resource[F, RedisClient[F]] =
-    RedisClient.toNode("127.0.0.1", p)
+  def clientUnderTest: Resource[F, RedisClient[F]]
 
   private[this] final val key: Key = "test-key"
   private[this] final val text     = "test text"

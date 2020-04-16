@@ -20,6 +20,9 @@ object RedisAddress {
   implicit final val redisAddressEq: Eq[RedisAddress] = Eq.instance { (a1, a2) =>
     a1.host.value === a2.host.value && a1.port.value === a2.port.value
   }
+
+  implicit final val portOrder: Order[Port] = Order.by(_.value)
+
   implicit final val redisAddressOrder: Order[RedisAddress] =
-    Order.by(redisAddress => (redisAddress.host.value, redisAddress.port.value))
+    Order.by(redisAddress => (redisAddress.host.value, redisAddress.port))
 }
