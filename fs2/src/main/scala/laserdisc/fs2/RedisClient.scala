@@ -6,6 +6,7 @@ import cats.data.NonEmptySet
 import cats.effect.concurrent.{Deferred, Ref}
 import cats.effect.{Blocker, Concurrent, ContextShift, Fiber, Resource, Timer}
 import cats.syntax.all._
+import _root_.fs2.io.tcp.SocketGroup
 import log.effect.LogWriter
 import shapeless._
 import cats.effect.syntax.concurrent._
@@ -86,27 +87,27 @@ object RedisClient {
         redisAddress.pure[F]
       case RedisClusterConnection(redisAddresses) =>
         // TODO: find cluster addresses
-        redisAddresses.head.pure[F]
+        redisAddresses.get.map
 //        redisAddresses.foldMapM { address =>
 //          connectToAddress(address)
 //        }
-//          .collectFirstSomeM {
-//          address => connectToAddress(address)
-//        }
+//        redisAddresses.collectFirstSomeM { address => connectToAddress(address) }
     }
 
-    def connectToAddress(address: RedisAddress): Pipe[F, RESP, RESP] =
+    def connectToAddress(socketGroup: SocketGroup)(address: RedisAddress): Pipe[F, RESP, RESP] =
       stream =>
         Stream.eval(address.toInetSocketAddress) >>= { address =>
           stream.through(
-            RedisChannel(address, writeTimeout, readMaxBytes)(blockingPool)
+            RedisChannel(address, writeTimeout, readMaxBytes)(socketGroup)
           )
         }
 
-    val establishedConnection: Resource[F, impl.Connection[F]] =
-      impl.connection(getAddress, connectToAddress, connection)
+    val createClient: Resource[F, RedisClient[F]] =
+      SocketGroup(blockingPool) >>= { socketGroup =>
+        impl.connection(getAddress, connectToAddress(socketGroup), connection) >>= impl.mkClient[F]
+      }
 
-    establishedConnection >>= { conn => impl.mkClient(conn) }
+    createClient
   }
 
   private[laserdisc] final object impl {
@@ -275,9 +276,7 @@ object RedisClient {
       Ref.of(State.empty).map { state =>
         new Publisher[F] {
           val start: F[Connection[F]] =
-            (state update { currentState =>
-              State.tryStart(currentState, establishedConn)
-            }) >> Concurrent[F].pure(establishedConn)
+            (state update { currentState => State.tryStart(currentState, establishedConn) }).as(establishedConn)
 
           val shutdown: F[Unit] =
             state set State.ShutDownState

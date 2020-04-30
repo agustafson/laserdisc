@@ -23,22 +23,18 @@ object RedisChannel {
       address: InetSocketAddress,
       writeTimeout: Option[FiniteDuration] = None,
       readMaxBytes: Int = 256 * 1024
-  )(blocker: Blocker): Pipe[F, RESP, RESP] = {
-    def connectedSocket: Resource[F, Socket[F]] =
-      SocketGroup(blocker) >>= (_.client(address))
+  )(socketGroup: SocketGroup): Pipe[F, RESP, RESP] = { stream =>
+    Stream.resource(socketGroup.client(address)) >>= { socket =>
+      val send    = stream.through(impl.send(socket.writes(writeTimeout)))
+      val receive = socket.reads(readMaxBytes).through(impl.receive)
 
-    stream =>
-      Stream.resource(connectedSocket) >>= { socket =>
-        val send    = stream.through(impl.send(socket.writes(writeTimeout)))
-        val receive = socket.reads(readMaxBytes).through(impl.receive)
-
-        send.drain
-          .covaryOutput[RESP]
-          .onFinalizeWeak(socket.endOfInput)
-          .mergeHaltBoth(
-            receive.onFinalizeWeak(socket.endOfOutput)
-          )
-      }
+      send.drain
+        .covaryOutput[RESP]
+        .onFinalizeWeak(socket.endOfInput)
+        .mergeHaltBoth(
+          receive.onFinalizeWeak(socket.endOfOutput)
+        )
+    }
   }
 
   private[this] final object impl {

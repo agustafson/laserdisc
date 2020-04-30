@@ -13,7 +13,7 @@ import cats.syntax.traverse._
 import laserdisc.auto._
 import laserdisc.fs2.RedisAddress.portOrder
 import log.effect.LogWriter
-import log.effect.fs2.SyncLogWriter.noOpLog
+import log.effect.fs2.SyncLogWriter
 import org.scalatest.matchers.should.Matchers
 import org.scalatest.wordspec.AnyWordSpecLike
 
@@ -41,7 +41,7 @@ private[fs2] trait ClientSpec extends ClientBaseSpec[IO] {
   override implicit val contextShift: ContextShift[IO] = IO.contextShift(ec)
   override implicit val timer: Timer[IO]               = IO.timer(ec)
   override implicit val concurrent: Concurrent[IO]     = IO.ioConcurrentEffect
-  override implicit val logger: LogWriter[IO]          = noOpLog[IO]
+  override implicit val logger: LogWriter[IO]          = SyncLogWriter.scribeLog[IO](this.getClass).unsafeRunSync()
 
   override def run[A]: IO[A] => A = _.unsafeRunSync()
 }
